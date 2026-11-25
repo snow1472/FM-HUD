@@ -356,3 +356,5 @@ p.setTextSize(r * 0.15f);
 p.setColor(Color.rgb(200, 45, 45));
 c.drawText("KM/H", cx, cy + r * 0.40f, p);
 }
+}
+}
