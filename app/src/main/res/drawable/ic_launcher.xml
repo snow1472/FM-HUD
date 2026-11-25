@@ -1,10 +1,358 @@
-<vector xmlns:android="http://android.com"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <path android:fillColor="#0A0A0A" android:pathData="M0,0h108v108h-108z" />
-    <path android:strokeColor="#E51919" android:strokeWidth="4" android:fillColor="#00000000" android:pathData="M12,12h84v84h-84z" />
-    <path android:fillColor="#FFFFFF" android:pathData="M24,34h26v8h-17v9h14v8h-14v15h-9z" />
-    <path android:fillColor="#E51919" android:pathData="M55,34h9l7,15l7,-15h9v40h-9v-23l-7,14l-7,-14v23h-9z" />
-</vector>
+java
+package com.forza.hud;
+
+import android.app.Activity;
+import android.content.Context;
+import android.graphics.*;
+import android.net.wifi.WifiManager;
+import android.os.Bundle;
+import android.text.format.Formatter;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.WindowManager;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.List;
+
+public class MainActivity extends Activity {
+    private float rpm = 0, maxRpm = 7000, speedKmh = 0;
+    private int dynamicMaxSpeed = 280;
+    private int gear = 0;
+    private float posX = 0, posZ = 0, yaw = 0;
+    private final List<PointF> trackPoints = new ArrayList<>();
+    private String localIp = "获取中...";
+    private boolean showFullMap = false;
+    private HudView hudView;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        localIp = Formatter.formatIpAddress(wm.getConnectionInfo().getIpAddress());
+        hudView = new HudView(this);
+        setContentView(hudView);
+        startUdpListener();
+    }
+
+    private void startUdpListener() {
+        new Thread(() -> {
+            try (DatagramSocket socket = new DatagramSocket(9996)) {
+                byte[] buf = new byte;
+                DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                while (true) {
+                    socket.receive(packet);
+                    if (packet.getLength() >= 311) {
+                        ByteBuffer bb = ByteBuffer.wrap(packet.getData(), 0, packet.getLength());
+                        bb.order(ByteOrder.LITTLE_ENDIAN);
+                        if (bb.getInt(0) == 1) {
+                            float incomingMaxRpm = bb.getFloat(8);
+                            if (incomingMaxRpm > 1000f) maxRpm = incomingMaxRpm;
+
+                            int pi = bb.getInt(216);
+                            if (pi > 0) {
+                                if (pi <= 500) dynamicMaxSpeed = 240;
+                                else if (pi <= 700) dynamicMaxSpeed = 300;
+                                else if (pi <= 800) dynamicMaxSpeed = 340;
+                                else if (pi <= 900) dynamicMaxSpeed = 360;
+                                else dynamicMaxSpeed = 420;
+                            }
+
+                            rpm = bb.getFloat(16);
+                            yaw = bb.getFloat(56);
+                            posX = bb.getFloat(232);
+                            posZ = bb.getFloat(240);
+                            speedKmh = Math.max(0f, bb.getFloat(244) * 3.6f);
+                            gear = bb.get(307) & 0xFF;
+
+                            if (speedKmh > dynamicMaxSpeed - 10) {
+                                dynamicMaxSpeed = ((int)(speedKmh / 40) + 1) * 40;
+                            }
+
+                            synchronized (trackPoints) {
+                                if (trackPoints.isEmpty()) {
+                                    trackPoints.add(new PointF(posX, posZ));
+                                } else {
+                                    PointF last = trackPoints.get(trackPoints.size() - 1);
+                                    double dist = Math.hypot(posX - last.x, posZ - last.y);
+                                    if (dist > 400.0) {
+                                        trackPoints.clear();
+                                        trackPoints.add(new PointF(posX, posZ));
+                                    } else if (dist > 5.0 && trackPoints.size() < 4500) {
+                                        trackPoints.add(new PointF(posX, posZ));
+                                    }
+                                }
+                            }
+                            hudView.postInvalidate();
+                        }
+                    }
+                }
+            } catch (Exception e) { e.printStackTrace(); }
+        }).start();
+    }
+
+    class HudView extends View {
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        float touchDownX = 0;
+
+        public HudView(Context c) { super(c); }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    touchDownX = event.getX();
+                    if (showFullMap && event.getX() > getWidth() * 0.80f && event.getY() < 120f) {
+                        synchronized (trackPoints) { trackPoints.clear(); }
+                        invalidate();
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    float dx = event.getX() - touchDownX;
+                    if (dx > 110f && !showFullMap) {
+                        showFullMap = true;
+                        invalidate();
+                    } else if (dx < -110f && showFullMap) {
+                        showFullMap = false;
+                        invalidate();
+                    }
+                    return true;
+            }
+            return super.onTouchEvent(event);
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            int w = getWidth(), h = getHeight();
+            c.drawColor(Color.BLACK);
+
+            float gaugeMaxRpm = (float)(Math.ceil(maxRpm / 1000.0) * 1000.0);
+            float rpmRatio = gaugeMaxRpm > 0 ? Math.min(1f, rpm / gaugeMaxRpm) : 0f;
+            float redlineStartRatio = (maxRpm * 0.88f) / gaugeMaxRpm;
+            boolean inRedlineZone = rpm >= maxRpm * 0.88f;
+            boolean atRevLimiter = rpm >= maxRpm * 0.95f;
+            boolean pulse = atRevLimiter && ((System.currentTimeMillis() / 65) % 2 == 0);
+
+            String gearStr = (gear == 0) ? "R" : (gear == 11 ? "N" : String.valueOf(gear));
+
+            if (!showFullMap) {
+                drawSplitScreen(c, w, h, gaugeMaxRpm, rpmRatio, redlineStartRatio, inRedlineZone, atRevLimiter, pulse, gearStr);
+            } else {
+                drawFullMapScreen(c, w, h, inRedlineZone, pulse, gearStr);
+            }
+        }
+
+        private void drawSplitScreen(Canvas c, int w, int h, float gaugeMaxRpm, float rpmRatio, float redlineStartRatio, boolean inRedlineZone, boolean atRevLimiter, boolean pulse, String gearStr) {
+            if (atRevLimiter) {
+                p.setStyle(Paint.Style.STROKE);
+                p.setStrokeWidth(pulse ? 14f : 6f);
+                p.setColor(pulse ? Color.rgb(255, 25, 25) : Color.rgb(110, 0, 0));
+                c.drawRect(6, 6, w - 6, h - 6, p);
+            }
+
+            p.setStyle(Paint.Style.FILL);
+            p.setTextAlign(Paint.Align.CENTER);
+            p.setTextSize(22f);
+            p.setColor(Color.rgb(95, 95, 95));
+            c.drawText("IP: " + localIp + " : 9996   |   右滑展开全屏地图 →", w * 0.5f, 32f, p);
+
+            float radius = Math.min(w * 0.165f, h * 0.235f);
+            float leftCx = w * 0.25f, rightCx = w * 0.75f, topCy = h * 0.30f;
+
+            drawRpmGauge(c, leftCx, topCy, radius, gaugeMaxRpm, rpmRatio, redlineStartRatio, inRedlineZone, atRevLimiter, pulse);
+            drawSpeedGauge(c, rightCx, topCy, radius, dynamicMaxSpeed, Math.min(1f, speedKmh / dynamicMaxSpeed), atRevLimiter, pulse);
+
+            p.setStyle(Paint.Style.FILL);
+            p.setTextAlign(Paint.Align.CENTER);
+            p.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+            p.setTextSize(radius * 1.15f);
+            p.setColor(atRevLimiter ? (pulse ? Color.rgb(255, 35, 35) : Color.WHITE) : (inRedlineZone ? Color.rgb(255, 90, 90) : Color.WHITE));
+            c.drawText(gearStr, w * 0.5f, topCy + radius * 0.38f, p);
+
+            p.setTextSize(22f);
+            p.setColor(Color.rgb(190, 40, 40));
+            c.drawText("GEAR", w * 0.5f, topCy - radius * 0.65f, p);
+
+            float splitY = h * 0.56f;
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(2f);
+            p.setColor(Color.rgb(60, 15, 15));
+            c.drawLine(w * 0.08f, splitY, w * 0.92f, splitY, p);
+
+            RectF mapArea = new RectF(w * 0.06f, splitY + 18f, w * 0.94f, h - 20f);
+            drawWhiteTrackMap(c, mapArea, 8f, 16f, false);
+        }
+
+        private void drawFullMapScreen(Canvas c, int w, int h, boolean inRedlineZone, boolean pulse, String gearStr) {
+            p.setStyle(Paint.Style.FILL);
+            p.setTextAlign(Paint.Align.LEFT);
+            p.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+            p.setTextSize(36f);
+            p.setColor(inRedlineZone ? Color.RED : Color.WHITE);
+            c.drawText("← 返回仪表   |   挡位: " + gearStr + "   |   " + (int)speedKmh + " KM/H   |   " + (int)rpm + " RPM", 40f, 54f, p);
+
+            p.setTextAlign(Paint.Align.RIGHT);
+            p.setTextSize(30f);
+            p.setColor(Color.rgb(60, 170, 255));
+            c.drawText("[ 重置地图 ]", w - 40f, 52f, p);
+
+            RectF fullMapArea = new RectF(w * 0.05f, 80f, w * 0.95f, h - 30f);
+            drawWhiteTrackMap(c, fullMapArea, 12f, 22f, true);
+        }
+
+        private void drawWhiteTrackMap(Canvas c, RectF area, float lineWidth, float arrowSize, boolean isFull) {
+            synchronized (trackPoints) {
+                if (trackPoints.size() < 3) {
+                    p.setStyle(Paint.Style.FILL);
+                    p.setTextAlign(Paint.Align.CENTER);
+                    p.setTextSize(isFull ? 34f : 26f);
+                    p.setColor(Color.rgb(110, 110, 110));
+                    c.drawText("行驶中自动生成白色赛道全貌（向右滑动屏幕可展开全屏地图）", area.centerX(), area.centerY(), p);
+                    return;
+                }
+
+                float minX = Float.MAX_VALUE, maxX = -Float.MAX_VALUE;
+请谨慎使用此类代码。
+float minZ = Float.MAX_VALUE, maxZ = -Float.MAX_VALUE;
+for (PointF pt : trackPoints) {
+if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x;
+if (pt.y < minZ) minZ = pt.y; if (pt.y > maxZ) maxZ = pt.y;
+}
+minX = Math.min(minX, posX); maxX = Math.max(maxX, posX);
+minZ = Math.min(minZ, posZ); maxZ = Math.max(maxZ, posZ);
+float padW = area.width() * 0.88f, padH = area.height() * 0.84f;
+float scale = Math.min(padW / Math.max(10f, maxX - minX), padH / Math.max(10f, maxZ - minZ));
+float cx = (minX + maxX) * 0.5f, cz = (minZ + maxZ) * 0.5f;
+float screenCx = area.centerX(), screenCy = area.centerY();
+p.setStyle(Paint.Style.STROKE);
+p.setStrokeCap(Paint.Cap.ROUND);
+p.setStrokeJoin(Paint.Join.ROUND);
+p.setStrokeWidth(lineWidth + 8f);
+p.setColor(Color.argb(65, 255, 255, 255));
+Path trackPath = new Path();
+for (int i = 0; i < trackPoints.size(); i++) {
+float sx = screenCx + (trackPoints.get(i).x - cx) * scale;
+float sy = screenCy - (trackPoints.get(i).y - cz) * scale;
+if (i == 0) trackPath.moveTo(sx, sy); else trackPath.lineTo(sx, sy);
+}
+c.drawPath(trackPath, p);
+p.setStrokeWidth(lineWidth);
+p.setColor(Color.WHITE);
+c.drawPath(trackPath, p);
+float carX = screenCx + (posX - cx) * scale;
+float carY = screenCy - (posZ - cz) * scale;
+p.setStyle(Paint.Style.FILL);
+p.setColor(Color.argb(85, 0, 150, 255));
+c.drawCircle(carX, carY, arrowSize * 1.45f, p);
+c.save();
+c.translate(carX, carY);
+c.rotate((float)Math.toDegrees(yaw));
+Path arrowPath = new Path();
+arrowPath.moveTo(0, -arrowSize * 1.25f);
+arrowPath.lineTo(arrowSize * 0.85f, arrowSize * 0.85f);
+arrowPath.lineTo(0, arrowSize * 0.40f);
+arrowPath.lineTo(-arrowSize * 0.85f, arrowSize * 0.85f);
+arrowPath.close();
+p.setStyle(Paint.Style.FILL);
+p.setColor(Color.rgb(0, 168, 255));
+c.drawPath(arrowPath, p);
+p.setStyle(Paint.Style.STROKE);
+p.setStrokeWidth(2.5f);
+p.setColor(Color.rgb(0, 70, 160));
+c.drawPath(arrowPath, p);
+c.restore();
+}
+}
+private void drawRpmGauge(Canvas c, float cx, float cy, float r, float gaugeMaxRpm, float fillRatio, float redStartRatio, boolean inRedZone, boolean atLimiter, boolean pulse) {
+RectF oval = new RectF(cx - r, cy - r, cx + r, cy + r);
+float startAngle = 135f, sweepMax = 270f;
+p.setStyle(Paint.Style.STROKE);
+p.setStrokeWidth(3.5f);
+p.setColor(atLimiter && pulse ? Color.rgb(255, 45, 45) : Color.rgb(95, 15, 15));
+c.drawCircle(cx, cy, r + 16f, p);
+p.setStrokeCap(Paint.Cap.BUTT);
+p.setStrokeWidth(20f);
+p.setColor(Color.rgb(36, 12, 12));
+c.drawArc(oval, startAngle, sweepMax * redStartRatio, false, p);
+p.setColor(Color.rgb(120, 12, 12));
+c.drawArc(oval, startAngle + sweepMax * redStartRatio, sweepMax * (1f - redStartRatio), false, p);
+p.setStrokeCap(Paint.Cap.ROUND);
+int arcColor = atLimiter
+? (pulse ? Color.WHITE : Color.rgb(255, 20, 20))
+: (inRedZone ? Color.rgb(255, 30, 30) : Color.rgb((int)(180 + 75 * fillRatio), 20, 20));
+p.setColor(arcColor);
+p.setStrokeWidth(atLimiter && pulse ? 25f : 20f);
+c.drawArc(oval, startAngle, sweepMax * fillRatio, false, p);
+int maxDigit = (int)(gaugeMaxRpm / 1000f);
+for (int i = 0; i <= maxDigit; i++) {
+float stepRatio = (float)i / maxDigit;
+double rad = Math.toRadians(startAngle + sweepMax * stepRatio);
+boolean isRedTick = stepRatio >= redStartRatio;
+boolean active = stepRatio <= fillRatio;
+p.setStyle(Paint.Style.STROKE);
+p.setStrokeWidth(4f);
+p.setColor(isRedTick ? Color.rgb(255, 40, 40) : (active ? Color.rgb(255, 110, 110) : Color.rgb(90, 35, 35)));
+c.drawLine((float)(cx + Math.cos(rad) * (r - 28f)), (float)(cy + Math.sin(rad) * (r - 28f)),
+(float)(cx + Math.cos(rad) * (r - 14f)), (float)(cy + Math.sin(rad) * (r - 14f)), p);
+p.setStyle(Paint.Style.FILL);
+p.setTextAlign(Paint.Align.CENTER);
+p.setTextSize(r * 0.14f);
+p.setColor(isRedTick ? Color.rgb(255, 50, 50) : (active ? Color.WHITE : Color.rgb(140, 140, 140)));
+float textR = r - 44f;
+c.drawText(String.valueOf(i), (float)(cx + Math.cos(rad) * textR), (float)(cy + Math.sin(rad) * textR) + r * 0.05f, p);
+}
+p.setStyle(Paint.Style.FILL);
+p.setTextAlign(Paint.Align.CENTER);
+p.setTextSize(r * 0.42f);
+p.setColor(inRedZone ? Color.rgb(255, 70, 70) : Color.WHITE);
+c.drawText(String.valueOf((int)rpm), cx, cy + r * 0.14f, p);
+p.setTextSize(r * 0.15f);
+p.setColor(Color.rgb(200, 45, 45));
+c.drawText("RPM", cx, cy + r * 0.40f, p);
+}
+private void drawSpeedGauge(Canvas c, float cx, float cy, float r, int maxSpd, float fillRatio, boolean atLimiter, boolean pulse) {
+RectF oval = new RectF(cx - r, cy - r, cx + r, cy + r);
+float startAngle = 135f, sweepMax = 270f;
+p.setStyle(Paint.Style.STROKE);
+p.setStrokeWidth(3.5f);
+p.setColor(atLimiter && pulse ? Color.rgb(255, 45, 45) : Color.rgb(95, 15, 15));
+c.drawCircle(cx, cy, r + 16f, p);
+p.setStrokeCap(Paint.Cap.ROUND);
+p.setStrokeWidth(20f);
+p.setColor(Color.rgb(36, 12, 12));
+c.drawArc(oval, startAngle, sweepMax, false, p);
+p.setColor(Color.rgb((int)(175 + 80 * fillRatio), 22, 22));
+p.setStrokeWidth(20f);
+c.drawArc(oval, startAngle, sweepMax * fillRatio, false, p);
+int steps = 8;
+for (int i = 0; i <= steps; i++) {
+float stepRatio = (float)i / steps;
+double rad = Math.toRadians(startAngle + sweepMax * stepRatio);
+boolean active = stepRatio <= fillRatio;
+p.setStyle(Paint.Style.STROKE);
+p.setStrokeWidth(4f);
+p.setColor(active ? Color.rgb(255, 110, 110) : Color.rgb(90, 35, 35));
+c.drawLine((float)(cx + Math.cos(rad) * (r - 28f)), (float)(cy + Math.sin(rad) * (r - 28f)),
+(float)(cx + Math.cos(rad) * (r - 14f)), (float)(cy + Math.sin(rad) * (r - 14f)), p);
+if (i % 2 == 0) {
+p.setStyle(Paint.Style.FILL);
+p.setTextAlign(Paint.Align.CENTER);
+p.setTextSize(r * 0.13f);
+p.setColor(active ? Color.WHITE : Color.rgb(140, 140, 140));
+float textR = r - 44f;
+int spdLabel = Math.round(maxSpd * stepRatio);
+c.drawText(String.valueOf(spdLabel), (float)(cx + Math.cos(rad) * textR), (float)(cy + Math.sin(rad) * textR) + r * 0.05f, p);
+}
+}
+p.setStyle(Paint.Style.FILL);
+p.setTextAlign(Paint.Align.CENTER);
+p.setTextSize(r * 0.48f);
+p.setColor(Color.WHITE);
+c.drawText(String.valueOf((int)speedKmh), cx, cy + r * 0.16f, p);
+p.setTextSize(r * 0.15f);
+p.setColor(Color.rgb(200, 45, 45));
+c.drawText("KM/H", cx, cy + r * 0.40f, p);
+}
